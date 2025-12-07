@@ -85,3 +85,7 @@ MIT License - feel free to use, modify, and distribute.
 ---
 
 Made with privacy in mind.
+
+Friend
+[Nana Banana Pro](https://nanabanana.pro)
+[Seedream 4.5](https://seedream 4.5)
