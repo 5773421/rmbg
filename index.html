@@ -426,6 +426,7 @@
         }
 
         .consent-overlay.hidden {
+            visibility: hidden;
             opacity: 0;
             pointer-events: none;
         }
@@ -436,7 +437,8 @@
             border-radius: 16px;
             max-width: 520px;
             width: 100%;
-            overflow: hidden;
+            max-height: calc(100dvh - 4rem);
+            overflow-y: auto;
             transform: translateY(0);
             transition: transform 0.3s ease;
         }
@@ -1771,7 +1773,7 @@
     </footer>
 
     <!-- Privacy Consent Modal -->
-    <div class="consent-overlay" id="consent-overlay">
+    <div class="consent-overlay hidden" id="consent-overlay" role="dialog" aria-modal="true" aria-labelledby="consent-title" inert>
         <div class="consent-modal">
             <div class="consent-header">
                 <div class="consent-header-icon">
@@ -1780,8 +1782,8 @@
                     </svg>
                 </div>
                 <div class="consent-header-text">
-                    <h3>First Time · Load AI Model</h3>
-                    <p>Model only needs to load once, cached for future visits</p>
+                    <h3 id="consent-title">Download AI Model to Remove Background</h3>
+                    <p>About 234MB on first use; reused while cached in your browser</p>
                 </div>
             </div>
 
@@ -1833,8 +1835,9 @@
                         <polyline points="7 10 12 15 17 10"/>
                         <line x1="12" y1="15" x2="12" y2="3"/>
                     </svg>
-                    <span>Load Model & Start</span>
+                    <span>Download Model & Continue</span>
                 </button>
+                <button class="btn btn-secondary" id="btn-cancel-model">Not Now</button>
                 <p class="consent-note">By clicking, you understand this is a fully local tool and your data stays under your control</p>
             </div>
         </div>
@@ -1877,12 +1880,14 @@
             // RMBG-1.4 ONNX model
             MODEL_URL: 'https://cdn.nanabanana.pro/res/model.onnx',
             INPUT_SIZE: 1024,
-            CACHE_KEY: 'rmbg-model-loaded',
+            CACHE_NAME: 'rmbg-model-cache-v1',
         };
 
         // State
         let session = null;
         let isModelLoaded = false;
+        let modelReadyPromise = null;
+        let finishModelConsent = null;
         let currentBackend = 'unknown';
         let batchMode = false;
         let batchQueue = [];
@@ -1893,6 +1898,7 @@
             consentOverlay: document.getElementById('consent-overlay'),
             loadingOverlay: document.getElementById('loading-overlay'),
             btnLoadModel: document.getElementById('btn-load-model'),
+            btnCancelModel: document.getElementById('btn-cancel-model'),
             loadingStatus: document.getElementById('loading-status'),
             progressFill: document.getElementById('progress-fill'),
             progressText: document.getElementById('progress-text'),
@@ -1978,7 +1984,51 @@
         // Model Loading
         // ============================================
 
-        async function loadModel() {
+        function requestModelDownload() {
+            return new Promise(resolve => {
+                const previousFocus = document.activeElement;
+                elements.consentOverlay.inert = false;
+                elements.consentOverlay.classList.remove('hidden');
+                elements.btnLoadModel.focus();
+
+                finishModelConsent = accepted => {
+                    finishModelConsent = null;
+                    elements.consentOverlay.classList.add('hidden');
+                    elements.consentOverlay.inert = true;
+                    previousFocus?.focus();
+                    resolve(accepted);
+                };
+            });
+        }
+
+        function ensureModelReady() {
+            if (isModelLoaded) return Promise.resolve(true);
+            if (modelReadyPromise) return modelReadyPromise;
+
+            modelReadyPromise = (async () => {
+                let cachedResponse = null;
+                try {
+                    const cache = await caches.open(CONFIG.CACHE_NAME);
+                    cachedResponse = await cache.match(CONFIG.MODEL_URL);
+                } catch (error) {
+                    console.warn('Model cache is unavailable:', error);
+                }
+
+                // Only a real cache hit can skip download consent.
+                // Keep the selected files waiting while the user retries or cancels.
+                while (true) {
+                    if (!cachedResponse && !(await requestModelDownload())) return false;
+                    if (await loadModel(cachedResponse)) return true;
+                    cachedResponse = null;
+                }
+            })().finally(() => {
+                modelReadyPromise = null;
+            });
+
+            return modelReadyPromise;
+        }
+
+        async function loadModel(cachedResponse) {
             try {
                 elements.consentOverlay.classList.add('hidden');
                 elements.loadingOverlay.classList.remove('hidden');
@@ -2010,71 +2060,58 @@
 
                 updateProgress(15, 'Checking model cache...');
 
-                // Try to load from Cache API first
-                const CACHE_NAME = 'rmbg-model-cache-v1';
                 let modelBuffer;
+                if (cachedResponse) {
+                    updateProgress(20, 'Loading model from cache...');
+                    modelBuffer = new Uint8Array(await cachedResponse.arrayBuffer());
+                } else {
+                    // This path is reached only after download consent.
+                    updateProgress(15, 'Downloading AI model...');
 
-                try {
-                    const cache = await caches.open(CACHE_NAME);
-                    const cachedResponse = await cache.match(CONFIG.MODEL_URL);
+                    const response = await fetch(CONFIG.MODEL_URL);
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const contentLength = response.headers.get('content-length');
+                    const total = contentLength ? parseInt(contentLength, 10) : 0;
 
-                    if (cachedResponse) {
-                        updateProgress(20, 'Loading model from cache...');
-                        const arrayBuffer = await cachedResponse.arrayBuffer();
+                    if (total === 0) {
+                        // No content-length, direct download
+                        const arrayBuffer = await response.arrayBuffer();
                         modelBuffer = new Uint8Array(arrayBuffer);
-                        updateProgress(85, 'Initializing inference session...');
-                        console.log('Model loaded from cache');
                     } else {
-                        // Download and cache
-                        updateProgress(15, 'Downloading AI model...');
+                        let loaded = 0;
+                        const reader = response.body.getReader();
+                        const chunks = [];
 
-                        const response = await fetch(CONFIG.MODEL_URL);
-                        const contentLength = response.headers.get('content-length');
-                        const total = contentLength ? parseInt(contentLength, 10) : 0;
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
 
-                        if (total === 0) {
-                            // No content-length, direct download
-                            const arrayBuffer = await response.arrayBuffer();
-                            modelBuffer = new Uint8Array(arrayBuffer);
-                        } else {
-                            let loaded = 0;
-                            const reader = response.body.getReader();
-                            const chunks = [];
+                            chunks.push(value);
+                            loaded += value.length;
 
-                            while (true) {
-                                const { done, value } = await reader.read();
-                                if (done) break;
-
-                                chunks.push(value);
-                                loaded += value.length;
-
-                                const percent = 15 + (loaded / total) * 70;
-                                updateProgress(percent, `Downloading model... ${(loaded / 1024 / 1024).toFixed(1)}MB / ${(total / 1024 / 1024).toFixed(1)}MB`);
-                            }
-
-                            // Combine chunks into ArrayBuffer
-                            modelBuffer = new Uint8Array(loaded);
-                            let position = 0;
-                            for (const chunk of chunks) {
-                                modelBuffer.set(chunk, position);
-                                position += chunk.length;
-                            }
+                            const percent = 15 + (loaded / total) * 70;
+                            updateProgress(percent, `Downloading model... ${(loaded / 1024 / 1024).toFixed(1)}MB / ${(total / 1024 / 1024).toFixed(1)}MB`);
                         }
 
-                        // Cache the model for future use
-                        updateProgress(85, 'Caching model to browser...');
-                        const cacheResponse = new Response(modelBuffer.buffer, {
-                            headers: { 'Content-Type': 'application/octet-stream' }
-                        });
-                        await cache.put(CONFIG.MODEL_URL, cacheResponse);
-                        console.log('Model cached for future use');
+                        // Combine chunks into ArrayBuffer
+                        modelBuffer = new Uint8Array(loaded);
+                        let position = 0;
+                        for (const chunk of chunks) {
+                            modelBuffer.set(chunk, position);
+                            position += chunk.length;
+                        }
                     }
-                } catch (cacheError) {
-                    console.warn('Cache API not available, downloading directly:', cacheError);
-                    // Fallback: direct download without caching
-                    const response = await fetch(CONFIG.MODEL_URL);
-                    const arrayBuffer = await response.arrayBuffer();
-                    modelBuffer = new Uint8Array(arrayBuffer);
+
+                    // A cache write failure must not download the model again.
+                    try {
+                        updateProgress(85, 'Caching model to browser...');
+                        const cache = await caches.open(CONFIG.CACHE_NAME);
+                        await cache.put(CONFIG.MODEL_URL, new Response(modelBuffer.buffer, {
+                            headers: { 'Content-Type': 'application/octet-stream' }
+                        }));
+                    } catch (cacheError) {
+                        console.warn('Model could not be cached:', cacheError);
+                    }
                 }
 
                 updateProgress(85, 'Initializing inference session...');
@@ -2103,23 +2140,16 @@
                 updateProgress(100, 'Loading complete!');
                 isModelLoaded = true;
 
-                // Save to cache indicator
-                localStorage.setItem(CONFIG.CACHE_KEY, 'true');
-
-                setTimeout(() => {
-                    elements.loadingOverlay.classList.add('hidden');
-                    showToast('Model loaded successfully, ready to use!');
-                }, 500);
+                elements.loadingOverlay.classList.add('hidden');
+                return true;
 
             } catch (error) {
                 console.error('Model loading error:', error);
                 updateProgress(0, 'Loading failed');
                 showToast('Model loading failed: ' + error.message, 'error');
 
-                setTimeout(() => {
-                    elements.loadingOverlay.classList.add('hidden');
-                    elements.consentOverlay.classList.remove('hidden');
-                }, 2000);
+                elements.loadingOverlay.classList.add('hidden');
+                return false;
             }
         }
 
@@ -2244,17 +2274,14 @@
         // ============================================
 
         async function handleFiles(files) {
-            if (!isModelLoaded) {
-                showToast('Please load the model first', 'error');
-                return;
-            }
-
             const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'));
 
             if (imageFiles.length === 0) {
                 showToast('Please select an image file', 'error');
                 return;
             }
+
+            if (!(await ensureModelReady())) return;
 
             if (batchMode && imageFiles.length > 1) {
                 // Add to batch queue
@@ -2379,21 +2406,34 @@
         // Event Listeners
         // ============================================
 
-        // Load model button
-        elements.btnLoadModel.addEventListener('click', loadModel);
+        // Download consent can be accepted, cancelled, or dismissed with Escape.
+        elements.btnLoadModel.addEventListener('click', () => finishModelConsent?.(true));
+        elements.btnCancelModel.addEventListener('click', () => finishModelConsent?.(false));
+        elements.consentOverlay.addEventListener('click', e => {
+            if (e.target === elements.consentOverlay) finishModelConsent?.(false);
+        });
+        document.addEventListener('keydown', e => {
+            if (!finishModelConsent) return;
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                finishModelConsent(false);
+            } else if (e.key === 'Tab') {
+                e.preventDefault();
+                const next = document.activeElement === elements.btnLoadModel
+                    ? elements.btnCancelModel : elements.btnLoadModel;
+                next.focus();
+            }
+        });
 
         // File input
         elements.fileInput.addEventListener('change', (e) => {
             handleFiles(e.target.files);
+            e.target.value = ''; // Allow selecting the same image after cancelling.
         });
 
         // Upload area click
-        elements.uploadArea.addEventListener('click', () => {
-            if (isModelLoaded) {
-                elements.fileInput.click();
-            } else {
-                showToast('Please load the model first', 'error');
-            }
+        elements.uploadArea.addEventListener('click', e => {
+            if (e.target !== elements.fileInput) elements.fileInput.click();
         });
 
         // Drag and drop
@@ -2469,28 +2509,8 @@
         // Initialization
         // ============================================
 
-        async function init() {
-            // Detect backend on load
-            await detectBackend();
-
-            // Check if model is cached, auto-load if yes
-            const CACHE_NAME = 'rmbg-model-cache-v1';
-            try {
-                const cache = await caches.open(CACHE_NAME);
-                const cachedResponse = await cache.match(CONFIG.MODEL_URL);
-
-                if (cachedResponse) {
-                    // Model is cached, skip consent and auto-load
-                    console.log('Model found in cache, auto-loading...');
-                    elements.consentOverlay.classList.add('hidden');
-                    await loadModel();
-                }
-            } catch (e) {
-                console.log('Cache check failed:', e);
-            }
-        }
-
-        init();
+        // Model cache checks and downloads start only after an image is selected.
+        detectBackend();
     </script>
 </body>
 </html>

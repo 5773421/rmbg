@@ -18,7 +18,7 @@ A **100% privacy-focused** AI background remover that runs entirely in your brow
 
 ## How It Works
 
-1. First visit downloads the AI model (~234MB) to browser cache
+1. Select or drop an image to start; if the AI model is not cached, confirm the ~234MB download. Browsing the page does not download the model.
 2. Model runs locally using WebGPU (GPU) or WebAssembly (CPU) fallback
 3. Images are processed entirely on your device
 4. Results are generated instantly without any server communication
